@@ -79,11 +79,11 @@ class PrefixEncoder(torch.nn.Module):
         self.prefix_projection = config.prefix_projection
         token_dim = config.token_dim
         num_layers = config.num_layers
-        encoder_hidden_size = config.encoder_hidden_size
         num_virtual_tokens = config.num_virtual_tokens
         if self.prefix_projection and not config.inference_mode:
             # Use a two-layer MLP to encode the prefix
             self.embedding = torch.nn.Embedding(num_virtual_tokens, token_dim)
+            encoder_hidden_size = config.encoder_hidden_size
             self.transform = torch.nn.Sequential(
                 torch.nn.Linear(token_dim, encoder_hidden_size),
                 torch.nn.Tanh(),
@@ -93,9 +93,7 @@ class PrefixEncoder(torch.nn.Module):
             self.embedding = torch.nn.Embedding(num_virtual_tokens, num_layers * 2 * token_dim)
 
     def forward(self, prefix: torch.Tensor):
-        if self.prefix_projection:
-            prefix_tokens = self.embedding(prefix)
-            past_key_values = self.transform(prefix_tokens)
-        else:
-            past_key_values = self.embedding(prefix)
-        return past_key_values
+        if not self.prefix_projection:
+            return self.embedding(prefix)
+        prefix_tokens = self.embedding(prefix)
+        return self.transform(prefix_tokens)

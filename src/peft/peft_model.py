@@ -159,7 +159,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         model = set_peft_model_state_dict(model, adapters_weights)
         if getattr(model, "hf_device_map", None) is not None:
             device_map = kwargs.get("device_map", "auto")
-            max_memory = kwargs.get("max_memory", None)
+            max_memory = kwargs.get("max_memory")
             no_split_module_classes = model._no_split_modules
             if device_map != "sequential":
                 max_memory = get_balanced_memory(
@@ -229,34 +229,34 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         Returns the virtual prompts to use for Peft. Only applicable when `peft_config.peft_type != PeftType.LORA`.
         """
         prompt_tokens = self.prompt_tokens.unsqueeze(0).expand(batch_size, -1).to(self.device)
-        if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
-            prompt_tokens = prompt_tokens[:, : self.peft_config.num_virtual_tokens]
-            if self.peft_config.inference_mode:
-                past_key_values = self.prompt_encoder.embedding.weight.repeat(batch_size, 1, 1)
-            else:
-                past_key_values = self.prompt_encoder(prompt_tokens)
-            past_key_values = past_key_values.view(
-                batch_size,
-                self.peft_config.num_virtual_tokens,
-                self.peft_config.num_layers * 2,
-                self.peft_config.num_attention_heads,
-                self.peft_config.token_dim // self.peft_config.num_attention_heads,
+        if self.peft_config.peft_type != PeftType.PREFIX_TUNING:
+            return (
+                self.prompt_encoder.embedding.weight.repeat(batch_size, 1, 1)
+                if self.peft_config.inference_mode
+                else self.prompt_encoder(prompt_tokens)
             )
-            if self.peft_config.num_transformer_submodules == 2:
-                past_key_values = torch.cat([past_key_values, past_key_values], dim=2)
-            past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(
-                self.peft_config.num_transformer_submodules * 2
-            )
-            if TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING.get(self.config.model_type, None) is not None:
-                post_process_fn = TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING[self.config.model_type]
-                past_key_values = post_process_fn(past_key_values)
-            return past_key_values
-        else:
-            if self.peft_config.inference_mode:
-                prompts = self.prompt_encoder.embedding.weight.repeat(batch_size, 1, 1)
-            else:
-                prompts = self.prompt_encoder(prompt_tokens)
-            return prompts
+        prompt_tokens = prompt_tokens[:, : self.peft_config.num_virtual_tokens]
+        past_key_values = (
+            self.prompt_encoder.embedding.weight.repeat(batch_size, 1, 1)
+            if self.peft_config.inference_mode
+            else self.prompt_encoder(prompt_tokens)
+        )
+        past_key_values = past_key_values.view(
+            batch_size,
+            self.peft_config.num_virtual_tokens,
+            self.peft_config.num_layers * 2,
+            self.peft_config.num_attention_heads,
+            self.peft_config.token_dim // self.peft_config.num_attention_heads,
+        )
+        if self.peft_config.num_transformer_submodules == 2:
+            past_key_values = torch.cat([past_key_values, past_key_values], dim=2)
+        past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(
+            self.peft_config.num_transformer_submodules * 2
+        )
+        if TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING.get(self.config.model_type, None) is not None:
+            post_process_fn = TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING[self.config.model_type]
+            past_key_values = post_process_fn(past_key_values)
+        return past_key_values
 
     def print_trainable_parameters(self):
         """
@@ -360,32 +360,29 @@ class PeftModelForSequenceClassification(PeftModel):
         if kwargs.get("position_ids", None) is not None:
             warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
             kwargs["position_ids"] = None
-        kwargs.update(
-            {
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-            }
-        )
+        kwargs |= {
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
 
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
             return self._prefix_tuning_forward(input_ids=input_ids, **kwargs)
-        else:
-            if kwargs.get("token_type_ids", None) is not None:
-                kwargs["token_type_ids"] = torch.cat(
-                    (
-                        torch.zeros(batch_size, self.peft_config.num_virtual_tokens).to(self.device),
-                        kwargs["token_type_ids"],
-                    ),
-                    dim=1,
-                ).long()
-            if inputs_embeds is None:
-                inputs_embeds = self.word_embeddings(input_ids)
-            prompts = self.get_prompt(batch_size=batch_size)
-            inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
-            return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
+        if kwargs.get("token_type_ids", None) is not None:
+            kwargs["token_type_ids"] = torch.cat(
+                (
+                    torch.zeros(batch_size, self.peft_config.num_virtual_tokens).to(self.device),
+                    kwargs["token_type_ids"],
+                ),
+                dim=1,
+            ).long()
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        prompts = self.get_prompt(batch_size=batch_size)
+        inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
+        return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
     def _prefix_tuning_forward(
         self,
@@ -401,62 +398,64 @@ class PeftModelForSequenceClassification(PeftModel):
         batch_size = input_ids.shape[0]
         past_key_values = self.get_prompt(batch_size)
         fwd_params = list(inspect.signature(self.base_model.forward).parameters.keys())
-        kwargs.update(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "inputs_embeds": inputs_embeds,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-                "past_key_values": past_key_values,
-            }
-        )
+        kwargs |= {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "inputs_embeds": inputs_embeds,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+            "past_key_values": past_key_values,
+        }
         if "past_key_values" in fwd_params:
             return self.base_model(labels=labels, **kwargs)
-        else:
-            transformer_backbone_name = self.base_model.get_submodule(self.transformer_backbone_name)
-            fwd_params = list(inspect.signature(transformer_backbone_name.forward).parameters.keys())
-            if "past_key_values" not in fwd_params:
-                raise ValueError("Model does not support past key values which are required for prefix tuning.")
-            outputs = transformer_backbone_name(**kwargs)
-            pooled_output = outputs[1] if len(outputs) > 1 else outputs[0]
-            if "dropout" in [name for name, _ in list(self.base_model.named_children())]:
-                pooled_output = self.base_model.dropout(pooled_output)
-            logits = self.base_model.get_submodule(self.cls_layer_name)(pooled_output)
+        transformer_backbone_name = self.base_model.get_submodule(self.transformer_backbone_name)
+        fwd_params = list(inspect.signature(transformer_backbone_name.forward).parameters.keys())
+        if "past_key_values" not in fwd_params:
+            raise ValueError("Model does not support past key values which are required for prefix tuning.")
+        outputs = transformer_backbone_name(**kwargs)
+        pooled_output = outputs[1] if len(outputs) > 1 else outputs[0]
+        if "dropout" in [name for name, _ in list(self.base_model.named_children())]:
+            pooled_output = self.base_model.dropout(pooled_output)
+        logits = self.base_model.get_submodule(self.cls_layer_name)(pooled_output)
 
-            loss = None
-            if labels is not None:
+        loss = None
+        if labels is not None:
+            if self.base_model.num_labels == 1:
                 if self.config.problem_type is None:
-                    if self.base_model.num_labels == 1:
-                        self.config.problem_type = "regression"
-                    elif self.base_model.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                        self.config.problem_type = "single_label_classification"
-                    else:
-                        self.config.problem_type = "multi_label_classification"
+                    self.config.problem_type = "regression"
+            elif self.base_model.num_labels > 1 and labels.dtype in [
+                torch.long,
+                torch.int,
+            ]:
+                if self.config.problem_type is None:
+                    self.config.problem_type = "single_label_classification"
+            elif self.config.problem_type is None:
+                self.config.problem_type = "multi_label_classification"
 
-                if self.config.problem_type == "regression":
-                    loss_fct = MSELoss()
-                    if self.base_model.num_labels == 1:
-                        loss = loss_fct(logits.squeeze(), labels.squeeze())
-                    else:
-                        loss = loss_fct(logits, labels)
-                elif self.config.problem_type == "single_label_classification":
-                    loss_fct = CrossEntropyLoss()
-                    loss = loss_fct(logits.view(-1, self.base_model.num_labels), labels.view(-1))
-                elif self.config.problem_type == "multi_label_classification":
-                    loss_fct = BCEWithLogitsLoss()
-                    loss = loss_fct(logits, labels)
-            if not return_dict:
-                output = (logits,) + outputs[2:]
-                return ((loss,) + output) if loss is not None else output
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                loss = (
+                    loss_fct(logits.squeeze(), labels.squeeze())
+                    if self.base_model.num_labels == 1
+                    else loss_fct(logits, labels)
+                )
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.base_model.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
 
-            return SequenceClassifierOutput(
-                loss=loss,
-                logits=logits,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 class PeftModelForCausalLM(PeftModel):
@@ -521,15 +520,13 @@ class PeftModelForCausalLM(PeftModel):
         if kwargs.get("token_type_ids", None) is not None:
             warnings.warn("Token type ids are not supported for parameter efficient tuning. Ignoring token type ids")
             kwargs["token_type_ids"] = None
-        kwargs.update(
-            {
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-            }
-        )
+        kwargs |= {
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
 
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
             past_key_values = self.get_prompt(batch_size)
@@ -546,9 +543,7 @@ class PeftModelForCausalLM(PeftModel):
             return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
     def generate(self, **kwargs):
-        if not isinstance(self.peft_config, PromptLearningConfig):
-            return self.base_model.generate(**kwargs)
-        else:
+        if isinstance(self.peft_config, PromptLearningConfig):
             if "input_ids" not in kwargs:
                 raise ValueError("input_ids must be provided for Peft model generation")
             if kwargs.get("attention_mask", None) is not None:
@@ -567,21 +562,23 @@ class PeftModelForCausalLM(PeftModel):
                 )
                 kwargs["token_type_ids"] = None
 
-            return self.base_model.generate(**kwargs)
+        return self.base_model.generate(**kwargs)
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         model_kwargs = self.base_model_prepare_inputs_for_generation(*args, **kwargs)
-        if isinstance(self.peft_config, PromptLearningConfig):
-            if model_kwargs["past_key_values"] is None and self.peft_config.peft_type == PeftType.PREFIX_TUNING:
+        if (
+            isinstance(self.peft_config, PromptLearningConfig)
+            and model_kwargs["past_key_values"] is None
+        ):
+            if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
                 past_key_values = self.get_prompt(batch_size=model_kwargs["input_ids"].shape[0])
                 model_kwargs["past_key_values"] = past_key_values
             else:
-                if model_kwargs["past_key_values"] is None:
-                    prompts = self.get_prompt(batch_size=model_kwargs["input_ids"].shape[0])
-                    model_kwargs["inputs_embeds"] = torch.cat(
-                        (prompts, self.word_embeddings(model_kwargs["input_ids"])), dim=1
-                    )
-                    model_kwargs["input_ids"] = None
+                prompts = self.get_prompt(batch_size=model_kwargs["input_ids"].shape[0])
+                model_kwargs["inputs_embeds"] = torch.cat(
+                    (prompts, self.word_embeddings(model_kwargs["input_ids"])), dim=1
+                )
+                model_kwargs["input_ids"] = None
 
         return model_kwargs
 
@@ -660,16 +657,14 @@ class PeftModelForSeq2SeqLM(PeftModel):
         if kwargs.get("token_type_ids", None) is not None:
             warnings.warn("Token type ids are not supported for parameter efficient tuning. Ignoring token type ids")
             kwargs["token_type_ids"] = None
-        kwargs.update(
-            {
-                "attention_mask": attention_mask,
-                "decoder_attention_mask": decoder_attention_mask,
-                "labels": labels,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-            }
-        )
+        kwargs |= {
+            "attention_mask": attention_mask,
+            "decoder_attention_mask": decoder_attention_mask,
+            "labels": labels,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
 
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
             past_key_values = self.get_prompt(batch_size)
@@ -703,22 +698,21 @@ class PeftModelForSeq2SeqLM(PeftModel):
     def generate(self, **kwargs):
         if not isinstance(self.peft_config, PromptLearningConfig):
             return self.base_model.generate(**kwargs)
-        else:
-            if "input_ids" not in kwargs:
-                raise ValueError("input_ids must be provided for Peft model generation")
-            if kwargs.get("position_ids", None) is not None:
-                warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
-                kwargs["position_ids"] = None
-            if kwargs.get("token_type_ids", None) is not None:
-                warnings.warn(
-                    "Token type ids are not supported for parameter efficient tuning. Ignoring token type ids"
-                )
-                kwargs["token_type_ids"] = None
+        if "input_ids" not in kwargs:
+            raise ValueError("input_ids must be provided for Peft model generation")
+        if kwargs.get("position_ids", None) is not None:
+            warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
+            kwargs["position_ids"] = None
+        if kwargs.get("token_type_ids", None) is not None:
+            warnings.warn(
+                "Token type ids are not supported for parameter efficient tuning. Ignoring token type ids"
+            )
+            kwargs["token_type_ids"] = None
 
-            if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
-                return self.base_model.generate(**kwargs)
-            else:
-                raise NotImplementedError
+        if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
+            return self.base_model.generate(**kwargs)
+        else:
+            raise NotImplementedError
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         model_kwargs = self.base_model_prepare_inputs_for_generation(*args, **kwargs)
@@ -800,32 +794,29 @@ class PeftModelForTokenClassification(PeftModel):
         if kwargs.get("position_ids", None) is not None:
             warnings.warn("Position ids are not supported for parameter efficient tuning. Ignoring position ids.")
             kwargs["position_ids"] = None
-        kwargs.update(
-            {
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-            }
-        )
+        kwargs |= {
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+        }
 
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
             return self._prefix_tuning_forward(input_ids=input_ids, **kwargs)
-        else:
-            if kwargs.get("token_type_ids", None) is not None:
-                kwargs["token_type_ids"] = torch.cat(
-                    (
-                        torch.zeros(batch_size, self.peft_config.num_virtual_tokens).to(self.device),
-                        kwargs["token_type_ids"],
-                    ),
-                    dim=1,
-                ).long()
-            if inputs_embeds is None:
-                inputs_embeds = self.word_embeddings(input_ids)
-            prompts = self.get_prompt(batch_size=batch_size)
-            inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
-            return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
+        if kwargs.get("token_type_ids", None) is not None:
+            kwargs["token_type_ids"] = torch.cat(
+                (
+                    torch.zeros(batch_size, self.peft_config.num_virtual_tokens).to(self.device),
+                    kwargs["token_type_ids"],
+                ),
+                dim=1,
+            ).long()
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        prompts = self.get_prompt(batch_size=batch_size)
+        inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
+        return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
     def _prefix_tuning_forward(
         self,
@@ -841,43 +832,40 @@ class PeftModelForTokenClassification(PeftModel):
         batch_size = input_ids.shape[0]
         past_key_values = self.get_prompt(batch_size)
         fwd_params = list(inspect.signature(self.base_model.forward).parameters.keys())
-        kwargs.update(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "inputs_embeds": inputs_embeds,
-                "output_attentions": output_attentions,
-                "output_hidden_states": output_hidden_states,
-                "return_dict": return_dict,
-                "past_key_values": past_key_values,
-            }
-        )
+        kwargs |= {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "inputs_embeds": inputs_embeds,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+            "past_key_values": past_key_values,
+        }
         if "past_key_values" in fwd_params:
             return self.base_model(labels=labels, **kwargs)
-        else:
-            transformer_backbone_name = self.base_model.get_submodule(self.transformer_backbone_name)
-            fwd_params = list(inspect.signature(transformer_backbone_name.forward).parameters.keys())
-            if "past_key_values" not in fwd_params:
-                raise ValueError("Model does not support past key values which are required for prefix tuning.")
-            outputs = transformer_backbone_name(**kwargs)
-            sequence_output = outputs[0]
-            if "dropout" in [name for name, _ in list(self.base_model.named_children())]:
-                sequence_output = self.base_model.dropout(sequence_output)
-            logits = self.base_model.get_submodule(self.cls_layer_name)(sequence_output)
+        transformer_backbone_name = self.base_model.get_submodule(self.transformer_backbone_name)
+        fwd_params = list(inspect.signature(transformer_backbone_name.forward).parameters.keys())
+        if "past_key_values" not in fwd_params:
+            raise ValueError("Model does not support past key values which are required for prefix tuning.")
+        outputs = transformer_backbone_name(**kwargs)
+        sequence_output = outputs[0]
+        if "dropout" in [name for name, _ in list(self.base_model.named_children())]:
+            sequence_output = self.base_model.dropout(sequence_output)
+        logits = self.base_model.get_submodule(self.cls_layer_name)(sequence_output)
 
-            loss = None
-            loss = None
-            if labels is not None:
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        loss = None
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
-            if not return_dict:
-                output = (logits,) + outputs[2:]
-                return ((loss,) + output) if loss is not None else output
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
 
-            return TokenClassifierOutput(
-                loss=loss,
-                logits=logits,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
+        return TokenClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )

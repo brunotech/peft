@@ -122,19 +122,17 @@ class LoraModel(torch.nn.Module):
                 parent, target, target_name = self._get_submodules(key)
                 bias = target.bias is not None
                 if isinstance(target, bnb.nn.Linear8bitLt) and self.peft_config.enable_lora is None:
-                    kwargs.update(
-                        {
-                            "has_fp16_weights": target.state.has_fp16_weights,
-                            "memory_efficient_backward": target.state.memory_efficient_backward,
-                            "threshold": target.state.threshold,
-                            "index": target.index,
-                        }
-                    )
+                    kwargs |= {
+                        "has_fp16_weights": target.state.has_fp16_weights,
+                        "memory_efficient_backward": target.state.memory_efficient_backward,
+                        "threshold": target.state.threshold,
+                        "index": target.index,
+                    }
                     new_module = Linear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
                 elif isinstance(target, torch.nn.Linear) and self.peft_config.enable_lora is None:
                     new_module = Linear(target.in_features, target.out_features, bias=bias, **kwargs)
                 elif self.peft_config.enable_lora is not None:
-                    kwargs.update({"enable_lora": self.peft_config.enable_lora})
+                    kwargs["enable_lora"] = self.peft_config.enable_lora
                     if isinstance(target, Conv1D):
                         in_features, out_features = target.weight.shape
                     else:
@@ -273,13 +271,12 @@ class Linear(nn.Linear, LoraLayer):
             self.merged = True
 
     def forward(self, x: torch.Tensor):
-        if self.r > 0 and not self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-            if self.r > 0:
-                result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
-            return result
-        else:
+        if self.r <= 0 or self.merged:
             return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        if self.r > 0:
+            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return result
 
 
 class MergedLinear(nn.Linear, LoraLayer):
@@ -369,13 +366,12 @@ class MergedLinear(nn.Linear, LoraLayer):
     def forward(self, x: torch.Tensor):
         if self.merged:
             return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-        else:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-            if self.r > 0:
-                after_A = self.lora_A(self.lora_dropout(x))
-                after_B = self.lora_B(after_A.transpose(-2, -1)).transpose(-2, -1)
-                result += self.zero_pad(after_B) * self.scaling
-            return result
+        result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        if self.r > 0:
+            after_A = self.lora_A(self.lora_dropout(x))
+            after_B = self.lora_B(after_A.transpose(-2, -1)).transpose(-2, -1)
+            result += self.zero_pad(after_B) * self.scaling
+        return result
 
 
 class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
@@ -427,9 +423,7 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
     for n, p in model.named_parameters():
         if "lora_" not in n:
             p.requires_grad = False
-    if bias == "none":
-        return
-    elif bias == "all":
+    if bias == "all":
         for n, p in model.named_parameters():
             if "bias" in n:
                 p.requires_grad = True
@@ -437,5 +431,7 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
         for m in model.modules():
             if isinstance(m, LoraLayer) and hasattr(m, "bias") and m.bias is not None:
                 m.bias.requires_grad = True
+    elif bias == "none":
+        return
     else:
         raise NotImplementedError

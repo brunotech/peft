@@ -15,9 +15,10 @@
 from setuptools import setup
 from setuptools import find_packages
 
-extras = {}
-extras["quality"] = ["black ~= 22.0", "isort >= 5.5.4", "flake8 >= 3.8.3"]
-extras["docs_specific"] = ["hf-doc-builder"]
+extras = {
+    "quality": ["black ~= 22.0", "isort >= 5.5.4", "flake8 >= 3.8.3"],
+    "docs_specific": ["hf-doc-builder"],
+}
 extras["dev"] = extras["quality"] + extras["docs_specific"]
 
 setup(
