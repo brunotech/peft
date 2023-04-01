@@ -114,6 +114,4 @@ class PromptEmbedding(torch.nn.Module):
             self.embedding.weight = torch.nn.Parameter(word_embedding_weights)
 
     def forward(self, indices):
-        # Just get embeddings
-        prompt_embeddings = self.embedding(indices)
-        return prompt_embeddings
+        return self.embedding(indices)

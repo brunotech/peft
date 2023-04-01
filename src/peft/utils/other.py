@@ -74,13 +74,11 @@ def fsdp_auto_wrap_policy(model):
     from ..tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 
     def lambda_policy_fn(module):
-        if (
-            len(list(module.named_children())) == 0
+        return bool(
+            not list(module.named_children())
             and getattr(module, "weight", None) is not None
             and module.weight.requires_grad
-        ):
-            return True
-        return False
+        )
 
     lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
     transformer_wrap_policy = functools.partial(

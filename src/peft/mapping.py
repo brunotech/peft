@@ -138,8 +138,9 @@ def get_peft_model(model, peft_config):
     if peft_config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys():
         peft_config = _prepare_lora_config(peft_config, model_config)
         return PeftModel(model, peft_config)
-    if not isinstance(peft_config, PromptLearningConfig):
-        peft_config = _prepare_lora_config(peft_config, model_config)
-    else:
-        peft_config = _prepare_prompt_learning_config(peft_config, model_config)
+    peft_config = (
+        _prepare_prompt_learning_config(peft_config, model_config)
+        if isinstance(peft_config, PromptLearningConfig)
+        else _prepare_lora_config(peft_config, model_config)
+    )
     return MODEL_TYPE_TO_PEFT_MODEL_MAPPING[peft_config.task_type](model, peft_config)
